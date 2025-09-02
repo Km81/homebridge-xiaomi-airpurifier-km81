@@ -1,0 +1,30 @@
+{
+  "name": "@km81/homebridge-xiaomi-airpurifier",
+  "version": "1.1.5",
+  "description": "A modern, single-file Homebridge plugin for Xiaomi Air Purifier 2S and Pro.",
+  "main": "index.js",
+  "keywords": [
+    "homebridge-plugin",
+    "xiaomi",
+    "mi",
+    "airpurifier",
+    "mihome"
+  ],
+  "author": "Km81",
+  "license": "ISC",
+  "homepage": "https://github.com/Km81/homebridge-xiaomi-airpurifier",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Km81/homebridge-xiaomi-airpurifier.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Km81/homebridge-xiaomi-airpurifier/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "homebridge": ">=1.10.0"
+  },
+  "dependencies": {
+    "miio": "^0.15.6"
+  }
+}
