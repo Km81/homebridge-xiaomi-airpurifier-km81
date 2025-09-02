@@ -6,6 +6,9 @@ let PlatformAccessory, Service, Characteristic, UUIDGen;
 const PLATFORM_NAME = 'XiaomiAirPurifierPlatform';
 const PLUGIN_NAME = packageJson.name; // 패키지명 동기화
 const DEFAULT_POLLING = 15000;
+const RECONNECT_INTERVAL = 30000; // 완전 실패 후 재시도 주기
+const CONNECT_RETRY_MAX = 5;
+const CONNECT_RETRY_BASE_MS = 800; // 지수 백오프 시작값
 
 module.exports = (api) => {
   PlatformAccessory = api.platformAccessory;
@@ -121,7 +124,7 @@ class XiaomiAirPurifierPlatform {
       accessory.context.config = conf;
     }
     const dev = new XiaomiAirPurifierDevice(this, accessory, conf);
-    await dev.init();
+    await dev.init(); // 내부에서 실패해도 자가복구 루프를 띄우고 진행
     this.devices.push(dev);
   }
 }
@@ -136,6 +139,8 @@ class XiaomiAirPurifierDevice {
     this.config = accessory.context.config || config || {};
     this.device = null;
     this.pollTimer = null;
+    this.reconnectTimer = null;
+    this.connecting = false;
 
     // child accs
     this.child = {
@@ -188,7 +193,8 @@ class XiaomiAirPurifierDevice {
   async init() {
     const { Service, Characteristic } = this.hap;
 
-    await this.connect();
+    // 연결 시도 (실패해도 throw 하지 않음)
+    await this.connectWithRetry();
 
     // Main AirPurifier service
     const ap = this.accessory.getService(Service.AirPurifier) || this.accessory.addService(Service.AirPurifier, this.config.name);
@@ -245,19 +251,50 @@ class XiaomiAirPurifierDevice {
     await this.ensureSensorsAndSwitches();
 
     // 초기 동기화 + 폴링
-    await this.refresh();
+    try { await this.refresh(); } catch (_) {}
     this.schedulePolling();
   }
 
-  async connect() {
-    if (this.device) return;
-    try {
-      this.log.info(this.prefix(`연결 시도... (${this.config.ip})`));
-      this.device = await miio.device({ address: this.config.ip, token: this.config.token });
-      this.log.info(this.prefix('연결됨'));
-    } catch (e) {
-      this.log.error(this.prefix(`연결 실패: ${e.message || e}`));
-      throw e;
+  // ---------- 연결 관리 ----------
+  async connectWithRetry() {
+    if (this.device) return true;
+    if (this.connecting) return false;
+    this.connecting = true;
+
+    let attempt = 0;
+    while (attempt < CONNECT_RETRY_MAX && !this.device) {
+      attempt++;
+      try {
+        this.log.info(this.prefix(`연결 시도 ${attempt}/${CONNECT_RETRY_MAX} ... (${this.config.ip})`));
+        this.device = await miio.device({ address: this.config.ip, token: this.config.token });
+        this.log.info(this.prefix('연결됨'));
+        this.connecting = false;
+        return true;
+      } catch (e) {
+        const delay = CONNECT_RETRY_BASE_MS * Math.pow(2, attempt - 1);
+        this.log.warn(this.prefix(`연결 실패: ${e.message || e} → ${Math.round(delay)}ms 후 재시도`));
+        await sleep(delay);
+      }
+    }
+
+    this.connecting = false;
+    // 완전 실패: 일정 주기로 재연결 시도
+    this.scheduleReconnect();
+    return false;
+  }
+
+  scheduleReconnect() {
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(async () => {
+      this.device = null; // 안전하게 초기화
+      await this.connectWithRetry();
+    }, RECONNECT_INTERVAL);
+  }
+
+  ensureConnectedOrThrow() {
+    if (!this.device) {
+      const err = new Error('device not connected');
+      throw err;
     }
   }
 
@@ -270,6 +307,8 @@ class XiaomiAirPurifierDevice {
         await this.refresh();
       } catch (e) {
         this.log.error(this.prefix(`폴링 실패: ${e.message || e}`));
+        // 연결 문제면 재연결 스케줄링
+        this.scheduleReconnect();
       } finally {
         this.pollTimer = setTimeout(loop, iv);
       }
@@ -278,6 +317,10 @@ class XiaomiAirPurifierDevice {
   }
 
   async refresh() {
+    if (!this.device) {
+      await this.connectWithRetry();
+      if (!this.device) return; // 연결 안 되면 조용히 탈출
+    }
     // 모델간 프로퍼티 차이를 약간 커버: temperature/temp_dec, led vs led_b 등
     const props = await this.call('get_prop', [
       'power', 'mode', 'aqi', 'favorite_level', 'buzzer', 'led', 'led_b',
@@ -543,14 +586,28 @@ class XiaomiAirPurifierDevice {
   }
 
   async call(method, args, silent = false) {
-    await this.connect();
+    // 필요하면 즉시 재연결
+    if (!this.device) {
+      await this.connectWithRetry();
+      if (!this.device) throw new Error('not connected');
+    }
     try {
       const res = await this.device.call(method, args);
       if (!silent && this.log.debug) this.log.debug?.(this.prefix(`${method}(${JSON.stringify(args)}) → ${JSON.stringify(res)}`));
       return res;
     } catch (e) {
-      if (!silent) this.log.error(this.prefix(`${method} 실패: ${e.message || e}`));
-      throw e;
+      // 호출 중 연결 문제 발생 시 재연결 후 1회 재시도
+      this.log.warn(this.prefix(`${method} 호출 실패: ${e.message || e} → 재연결 시도`));
+      this.device = null;
+      await this.connectWithRetry();
+      if (!this.device) {
+        if (!silent) this.log.error(this.prefix(`${method} 재시도 불가(연결 실패)`));
+        this.scheduleReconnect();
+        throw e;
+      }
+      const res2 = await this.device.call(method, args);
+      if (!silent && this.log.debug) this.log.debug?.(this.prefix(`${method} 재시도 성공 → ${JSON.stringify(res2)}`));
+      return res2;
     }
   }
 
@@ -649,3 +706,4 @@ function capitalize(s) {
   const t = String(s || '');
   return t.charAt(0).toUpperCase() + t.slice(1);
 }
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
