@@ -1,6 +1,6 @@
 {
   "name": "homebridge-xiaomi-airpurifier-km81",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Homebridge plugin for Xiaomi Air Purifier (2S/Pro) with optimistic UI updates and optional Temperature/Humidity/AirQuality sensors.",
   "main": "index.js",
   "keywords": [
