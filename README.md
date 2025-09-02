@@ -15,7 +15,7 @@
 1.  공식 설명서에 따라 Homebridge를 설치하세요.
 2.  다음 명령어를 사용하여 이 플러그인을 설치하세요:
     ```bash
-    npm install -g @km81/homebridge-xiaomi-airpurifier
+    npm install -g homebridge-xiaomi-airpurifier-km81
     ```
     
 ---
