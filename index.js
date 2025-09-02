@@ -18,97 +18,100 @@ module.exports = (api) => {
 class XiaomiAirPurifierPlatform {
   constructor(log, config, api) {
     this.log = log;
-    this.config = config || {};
     this.api = api;
-    this.accessories = [];
-    this.log.info(`[샤오미 공기청정기] 플랫폼 초기화 v${packageJson.version}`);
-    this.api.on('didFinishLaunching', () => this.discoverDevices());
+    this.config = config || {};
+    this.accessories = new Map();
+    this.devices = [];
+    this.discoverTimer = null;
+
+    // backwards-compat / defaults
+    this.config.devices = Array.isArray(this.config.devices) ? this.config.devices : (this.config.devices ? [this.config.devices] : []);
+    for (const dev of this.config.devices) {
+      dev.name = (dev.name || dev.ip || 'Air Purifier').toString();
+      dev.token = (dev.token || '').toString();
+      dev.ip = (dev.ip || '').toString();
+      dev.type = (dev.type || 'MiAirPurifier2S').toString(); // MiAirPurifier2S | MiAirPurifierPro etc.
+      dev.model = (dev.model || '').toString();
+      dev.pollingInterval = Number.isFinite(dev.pollingInterval) ? dev.pollingInterval : POLLING_INTERVAL;
+
+      // feature toggles
+      dev.showLED = dev.showLED !== false; // default true
+      dev.separateLedAccessory = !!dev.separateLedAccessory;
+      dev.showBuzzer = dev.showBuzzer !== false; // default true
+      dev.separateBuzzerAccessory = !!dev.separateBuzzerAccessory;
+      dev.showAutoModeSwitch = dev.showAutoModeSwitch !== false;
+      dev.separateAutoModeAccessory = !!dev.separateAutoModeAccessory;
+      dev.showSleepModeSwitch = dev.showSleepModeSwitch !== false;
+      dev.separateSleepModeAccessory = !!dev.separateSleepModeAccessory;
+      dev.showFavoriteModeSwitch = dev.showFavoriteModeSwitch !== false;
+      dev.separateFavoriteModeAccessory = !!dev.separateFavoriteModeAccessory;
+
+      // names
+      dev.ledName = dev.ledName || '';
+      dev.buzzerName = dev.buzzerName || '';
+      dev.autoModeName = dev.autoModeName || '';
+      dev.sleepModeName = dev.sleepModeName || '';
+      dev.favoriteModeName = dev.favoriteModeName || '';
+
+      // favorite level bounds
+      dev.favoriteMin = Number.isFinite(dev.favoriteMin) ? dev.favoriteMin : 1;
+      dev.favoriteMax = Number.isFinite(dev.favoriteMax) ? dev.favoriteMax : 16;
+
+      // AQI thresholds [excellent, good, fair, inferior]
+      dev.aqiThresholds = this.validateAqiThresholds(dev.aqiThresholds, [15, 35, 75, 115]);
+    }
+
+    if (!this.config.devices.length) {
+      this.log.warn('No devices configured under "devices".');
+    }
+
+    api.on('didFinishLaunching', () => {
+      this.discover();
+    });
   }
 
   configureAccessory(accessory) {
-    this.log.info(`[샤오미 공기청정기] 캐시에서 악세서리 로드: ${accessory.displayName}`);
-    this.accessories.push(accessory);
+    this.accessories.set(accessory.UUID, accessory);
   }
 
-  discoverDevices() {
-    const configuredDevices = this.config.deviceCfgs || [];
-    // "메인 악세서리"만 추적 (자식은 제거 대상에서 제외)
-    const foundMainUUIDs = new Set();
-
-    for (const deviceConfig of configuredDevices) {
-      if (!deviceConfig || !deviceConfig.ip || !deviceConfig.token || !deviceConfig.name || !deviceConfig.type) {
-        this.log.warn('[샤오미 공기청정기] 설정 항목에 ip/token/name/type 누락이 있어 건너뜁니다.');
-        continue;
+  discover() {
+    let i = 0;
+    const loop = async () => {
+      clearTimeout(this.discoverTimer);
+      if (i >= this.config.devices.length) return;
+      const conf = this.config.devices[i++];
+      try {
+        await this.setupDevice(conf);
+      } catch (e) {
+        this.log.error(`[${conf.name}] setup error: ${e.message || e}`);
+      } finally {
+        this.discoverTimer = setTimeout(loop, 500);
       }
+    };
+    loop();
+  }
 
-      const supportedModels = ['MiAirPurifier2S', 'MiAirPurifierPro'];
-      if (!supportedModels.includes(deviceConfig.type)) {
-        this.log.warn(`[샤오미 공기청정기] 지원하지 않는 모델: ${deviceConfig.type} (건너뜀)`);
-        continue;
-      }
-
-      const uuid = UUIDGen.generate(deviceConfig.ip);
-      const existingAccessory = this.accessories.find((acc) => acc.UUID === uuid);
-
-      if (existingAccessory) {
-        this.log.info(`[샤오미 공기청정기] 기존 악세서리 복원: ${existingAccessory.displayName}`);
-        existingAccessory.context.device = deviceConfig;
-        existingAccessory.context.isChild = false; // 메인 표시
-        new DeviceHandler(this, existingAccessory);
-        foundMainUUIDs.add(existingAccessory.UUID);
-      } else {
-        this.log.info(`[샤오미 공기청정기] 새 악세서리 추가: ${deviceConfig.name}`);
-        const accessory = new PlatformAccessory(deviceConfig.name, uuid);
-        accessory.context.device = deviceConfig;
-        accessory.context.isChild = false; // 메인 표시
-        new DeviceHandler(this, accessory);
-        this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
-        this.accessories.push(accessory); // 새로 만든 것도 내부 배열에 넣어줌
-        foundMainUUIDs.add(accessory.UUID);
-      }
+  async setupDevice(conf) {
+    const uuid = UUIDGen.generate(`${conf.ip}-${conf.token}-${conf.name}`);
+    let accessory = this.accessories.get(uuid);
+    if (!accessory) {
+      accessory = new PlatformAccessory(conf.name, uuid);
+      accessory.context.config = conf;
+      accessory.category = this.api.hap.Categories.AIR_PURIFIER;
+      this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+      this.accessories.set(uuid, accessory);
+    } else {
+      accessory.context.config = conf;
     }
-
-    // ⚠️ 캐시 정리: 메인 악세서리만 대상. 자식(acc.context.isChild===true)은 유지!
-    const accessoriesToUnregister = this.accessories.filter(
-      (acc) => acc.context?.isChild !== true && !foundMainUUIDs.has(acc.UUID)
-    );
-    if (accessoriesToUnregister.length > 0) {
-      this.log.info(`[샤오미 공기청정기] 사용하지 않는 메인 악세서리 ${accessoriesToUnregister.length}개 등록 해제`);
-      this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, accessoriesToUnregister);
-      this.accessories = this.accessories.filter((acc) => !accessoriesToUnregister.includes(acc));
-    }
-  }
-}
-
-class DeviceHandler {
-  constructor(platform, accessory) {
-    this.platform = platform;
-    this.log = platform.log;
-    this.accessory = accessory;             // 메인 악세서리 (AirPurifier 본체)
-    this.config = accessory.context.device || {};
-    this.device = null;
-    this.state = {};                        // 캐시된 기기 상태
-    this.pollInterval = null;
-
-    this.maxFavoriteLevel = this.config.type === 'MiAirPurifier2S' ? 14 : 16;
-
-    // 공기질 임계값
-    this.aqThresholds = this.parseAqThresholds(this.config.airQualityThresholds);
-
-    // 자식 악세서리 레퍼런스
-    this.children = { temp: null, hum: null, aq: null, led: null, buzzer: null, auto: null, sleep: null, fav: null };
-
-    this.setupServices();
-    this.connect();
+    const device = new XiaomiAirPurifierDevice(this, accessory, conf);
+    await device.init();
+    this.devices.push(device);
   }
 
-  // ===== Helpers =====
-  prefix(msg) { return `[${this.config.name}] ${msg}`; }
-
-  parseAqThresholds(conf) {
-    const def = [5, 15, 35, 55];
-    if (conf && typeof conf === 'object' && !Array.isArray(conf)) {
-      const cand = [conf.t1, conf.t2, conf.t3, conf.t4].map((v) => Number(v));
+  validateAqiThresholds(conf, def) {
+    // conf can be string "15,35,75,115" or array [15,35,75,115]
+    if (typeof conf === 'string') {
+      const cand = conf.split(',').map((v) => Number(v.trim()));
       if (cand.every((v) => Number.isFinite(v) && v >= 0) && cand[0] <= cand[1] && cand[1] <= cand[2] && cand[2] <= cand[3]) return cand;
     }
     if (Array.isArray(conf) && conf.length === 4) {
@@ -117,195 +120,171 @@ class DeviceHandler {
     }
     return def;
   }
+}
 
-  mapAqiToHomeKitLevel(aqi, t) {
-    if (!Number.isFinite(aqi)) return Characteristic.AirQuality.UNKNOWN; // 0
-    if (aqi <= t[0]) return Characteristic.AirQuality.EXCELLENT; // 1
-    if (aqi <= t[1]) return Characteristic.AirQuality.GOOD;      // 2
-    if (aqi <= t[2]) return Characteristic.AirQuality.FAIR;      // 3
-    if (aqi <= t[3]) return Characteristic.AirQuality.INFERIOR;  // 4
-    return Characteristic.AirQuality.POOR;                        // 5
+class XiaomiAirPurifierDevice {
+  constructor(platform, accessory, config) {
+    this.platform = platform;
+    this.api = platform.api;
+    this.log = platform.log;
+    this.hap = platform.api.hap;
+    this.accessory = accessory;
+    this.config = accessory.context.config || config || {};
+    this.device = null;
+    this.children = { led: null, buzzer: null, auto: null, sleep: null, fav: null, aq: null };
+    this.pollTimer = null;
+
+    this.state = {
+      // power, mode, aqi, led, buzzer, favorite_level, filter life, etc.
+    };
+
+    this.maxFavoriteLevel = Math.max(1, Number(this.config.favoriteMax) || 16);
+    this.minFavoriteLevel = Math.max(1, Number(this.config.favoriteMin) || 1);
+
+    this.aqiThresholds = this.platform.validateAqiThresholds(this.config.aqiThresholds, [15, 35, 75, 115]);
+
+    // Services
+    this.ensureInformationService();
   }
 
-  setServiceName(service, name) {
-    try { service.updateCharacteristic(Characteristic.Name, name); } catch (_) {}
-    try { if (Characteristic.ConfiguredName) service.updateCharacteristic(Characteristic.ConfiguredName, name); } catch (_) {}
+  prefix(msg) { return `[${this.config.name}] ${msg}`; }
+  setServiceName(svc, name) {
+    try {
+      svc.setCharacteristic(Characteristic.ConfiguredName, name);
+    } catch (_) { /* older iOS */ }
+    try {
+      svc.setCharacteristic(Characteristic.Name, name);
+    } catch (_) { /* ignore */ }
   }
 
-  getChildUUID(suffix) { return UUIDGen.generate(`${this.config.ip}-${suffix}`); }
-
-  ensureChildAccessory(suffix, displayName, serviceType) {
-    const uuid = this.getChildUUID(suffix);
-    let acc = this.platform.accessories.find((a) => a.UUID === uuid);
-    if (!acc) {
-      acc = new PlatformAccessory(displayName, uuid);
-      acc.context.device = this.config;
-      acc.context.isChild = true; // ✅ 자식 표시
-      this.platform.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [acc]);
-      this.platform.accessories.push(acc);
-      this.log.info(this.prefix(`자식 악세서리 추가: ${displayName}`));
-    } else {
-      acc.context.isChild = true; // 캐시 복원 시에도 플래그 유지
-      const existingSvc = acc.getService(serviceType);
-      if (existingSvc) this.setServiceName(existingSvc, displayName);
-    }
-    return acc;
+  ensureInformationService() {
+    const info = this.accessory.getService(Service.AccessoryInformation) || this.accessory.addService(Service.AccessoryInformation);
+    info.setCharacteristic(Characteristic.Manufacturer, 'Xiaomi');
+    info.setCharacteristic(Characteristic.Model, this.config.model || this.config.type || 'Air Purifier');
+    info.setCharacteristic(Characteristic.SerialNumber, `${this.config.ip}`);
+    info.setCharacteristic(Characteristic.FirmwareRevision, packageJson.version || '1.0.0');
   }
 
-  removeChildAccessory(suffix) {
-    const uuid = this.getChildUUID(suffix);
-    const acc = this.platform.accessories.find((a) => a.UUID === uuid);
-    if (acc) {
-      this.platform.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [acc]);
-      this.platform.accessories = this.platform.accessories.filter((a) => a.UUID !== uuid);
-      this.log.info(this.prefix(`자식 악세서리 제거: ${acc.displayName}`));
-    }
+  async init() {
+    await this.connect();
+
+    const service =
+      this.accessory.getService(Service.AirPurifier) ||
+      this.accessory.addService(Service.AirPurifier, this.config.name);
+    this.setServiceName(service, this.config.name);
+
+    service.getCharacteristic(Characteristic.Active)
+      .onSet(async (v) => {
+        // optimistic update: reflect ON/OFF immediately in UI
+        const next = v ? 'on' : 'off';
+        const prev = this.state.power;
+        this.state.power = next;
+        try {
+          this.updateAllCharacteristics();
+          await this.setPropertyValue('set_power', [next]);
+        } catch (e) {
+          // revert on error
+          this.state.power = prev;
+          this.updateAllCharacteristics();
+          throw e;
+        }
+      });
+
+    // 0=MANUAL, 1=AUTO → AUTO=auto, MANUAL=favorite
+    service.getCharacteristic(Characteristic.TargetAirPurifierState)
+      .onSet(async (v) => {
+        const next = v === Characteristic.TargetAirPurifierState.AUTO ? 'auto' : 'favorite';
+        const prev = this.state.mode;
+        this.state.mode = next;
+        try {
+          this.updateAllCharacteristics();
+          await this.setPropertyValue('set_mode', [next]);
+        } catch (e) {
+          this.state.mode = prev;
+          this.updateAllCharacteristics();
+          throw e;
+        }
+      });
+
+    // 속도 슬라이더 → favorite 레벨로 (set_level_favorite 고정)
+    service.getCharacteristic(Characteristic.RotationSpeed)
+      .onSet(async (v) => {
+        const prevMode = this.state.mode;
+        this.state.mode = 'favorite';
+        try {
+          this.updateAllCharacteristics();
+          await this.setFavoriteLevelPercent(v);
+        } catch (e) {
+          this.state.mode = prevMode;
+          this.updateAllCharacteristics();
+          throw e;
+        }
+      });
+
+    // Sensors and switches
+    this.ensureSensorsAndSwitches();
+
+    // initial fetch + start polling
+    await this.refresh();
+    this.schedulePolling();
   }
 
-  isMethodNotFound(err) { return err && typeof err.message === 'string' && /method not found/i.test(err.message); }
-
-  // ===== Device I/O =====
   async connect() {
+    if (this.device) return;
     try {
       this.log.info(this.prefix(`연결 시도... (${this.config.ip})`));
       this.device = await miio.device({ address: this.config.ip, token: this.config.token });
-      this.log.info(this.prefix('연결 성공'));
-      clearInterval(this.pollInterval);
-      this.pollDeviceState(); // 즉시 1회 폴링
-      this.pollInterval = setInterval(() => this.pollDeviceState(), POLLING_INTERVAL);
+      this.log.info(this.prefix('연결됨'));
     } catch (e) {
-      this.log.error(this.prefix(`연결 실패 (30초 후 재시도): ${e.message}`));
-      setTimeout(() => this.connect(), 30000);
-    }
-  }
-
-  async pollDeviceState() {
-    if (!this.device) return;
-    try {
-      const props = ['power', 'mode', 'aqi', 'temp_dec', 'humidity', 'filter1_life', 'favorite_level', 'led', 'buzzer'];
-      const values = await this.device.call('get_prop', props);
-      props.forEach((prop, i) => { this.state[prop] = values[i]; });
-      this.updateAllCharacteristics();
-    } catch (e) {
-      this.log.error(this.prefix(`상태 폴링 실패: ${e.message}`));
-    }
-  }
-
-  async setPropertyValue(method, value) {
-    if (!this.device) throw new Error('Device not connected');
-    try {
-      const result = await this.device.call(method, value);
-      if (!Array.isArray(result) || result[0] !== 'ok') throw new Error(`기기 오류: ${Array.isArray(result) ? result[0] : String(result)}`);
-      setTimeout(() => this.pollDeviceState(), 250);
-    } catch (e) {
-      if (this.isMethodNotFound(e)) {
-        this.log.warn(this.prefix(`이 기기는 메서드 '${method}'를 지원하지 않습니다.`));
-      } else {
-        this.log.error(this.prefix(`'${method}' 호출 실패: ${e.message}`));
-        this.connect();
-      }
+      this.log.error(this.prefix(`연결 실패: ${e.message || e}`));
       throw e;
     }
   }
 
-  // ★ 속도 설정: set_level_favorite 고정 사용
-  async setFavoriteLevelPercent(percent) {
-    const level = Math.max(0, Math.min(100, Number(percent)));
-    const target = Math.max(1, Math.min(this.maxFavoriteLevel, Math.round((level / 100) * this.maxFavoriteLevel)));
+  schedulePolling() {
+    clearTimeout(this.pollTimer);
+    const iv = Number.isFinite(this.config.pollingInterval) ? this.config.pollingInterval : POLLING_INTERVAL;
+    const loop = async () => {
+      clearTimeout(this.pollTimer);
+      try {
+        await this.refresh();
+      } catch (e) {
+        this.log.error(this.prefix(`폴링 실패: ${e.message || e}`));
+      } finally {
+        this.pollTimer = setTimeout(loop, iv);
+      }
+    };
+    this.pollTimer = setTimeout(loop, iv);
+  }
 
-    // 수동(favorite) 모드로 전환 후 레벨 설정
+  async refresh() {
     try {
-      if (this.state.mode !== 'favorite') await this.setPropertyValue('set_mode', ['favorite']);
+      const props = await this.device.call('get_prop', [
+        'power', 'mode', 'aqi', 'favorite_level', 'buzzer', 'led',
+        'filter1_life', 'filter1_hours', 'average_aqi'
+      ]);
+      this.applyProps(props);
+      this.updateAllCharacteristics();
     } catch (e) {
-      if (!this.isMethodNotFound(e)) this.log.warn(this.prefix(`favorite 모드 전환 실패(무시): ${e.message}`));
-    }
-
-    try {
-      await this.setPropertyValue('set_level_favorite', [target]);
-      this.log.info(this.prefix(`속도 조정 : ${target}/${this.maxFavoriteLevel} (${level}%)`));
-    } catch (e) {
-      this.log.warn(this.prefix(`'set_level_favorite' 미지원/실패로 속도 조정 불가`));
+      this.log.error(this.prefix(`상태 조회 실패: ${e.message || e}`));
+      throw e;
     }
   }
 
-  // ===== Services / Accessories =====
-  setupServices() {
-    this.setupAccessoryInfo();
-    this.setupAirPurifierMain();
-
-    // Temperature
-    if (this.config.showTemperature !== false) {
-      if (this.config.separateTemperatureAccessory === true) {
-        const name = this.config.temperatureName || `${this.config.name} Temperature`;
-        const child = this.ensureChildAccessory('temp', name, Service.TemperatureSensor);
-        const svc = child.getService(Service.TemperatureSensor) || child.addService(Service.TemperatureSensor, name);
-        this.setServiceName(svc, name);
-        this.children.temp = { acc: child, svc };
-        const main = this.accessory.getServiceById(Service.TemperatureSensor, 'Temperature');
-        if (main) this.accessory.removeService(main);
-      } else {
-        this.children.temp = null;
-        let svc = this.accessory.getServiceById(Service.TemperatureSensor, 'Temperature');
-        if (!svc) {
-          const name = this.config.temperatureName || `${this.config.name} Temperature`;
-          svc = this.accessory.addService(Service.TemperatureSensor, name, 'Temperature');
-          this.setServiceName(svc, name);
-        }
-      }
-    } else {
-      const main = this.accessory.getServiceById(Service.TemperatureSensor, 'Temperature');
-      if (main) this.accessory.removeService(main);
-      this.removeChildAccessory('temp'); this.children.temp = null;
+  applyProps(props) {
+    const keys = ['power','mode','aqi','favorite_level','buzzer','led','filter1_life','filter1_hours','average_aqi'];
+    for (let i = 0; i < keys.length && i < props.length; i++) {
+      this.state[keys[i]] = props[i];
     }
+  }
 
-    // Humidity
-    if (this.config.showHumidity !== false) {
-      if (this.config.separateHumidityAccessory === true) {
-        const name = this.config.humidityName || `${this.config.name} Humidity`;
-        const child = this.ensureChildAccessory('hum', name, Service.HumiditySensor);
-        const svc = child.getService(Service.HumiditySensor) || child.addService(Service.HumiditySensor, name);
-        this.setServiceName(svc, name);
-        this.children.hum = { acc: child, svc };
-        const main = this.accessory.getServiceById(Service.HumiditySensor, 'Humidity');
-        if (main) this.accessory.removeService(main);
-      } else {
-        this.children.hum = null;
-        let svc = this.accessory.getServiceById(Service.HumiditySensor, 'Humidity');
-        if (!svc) {
-          const name = this.config.humidityName || `${this.config.name} Humidity`;
-          svc = this.accessory.addService(Service.HumiditySensor, name, 'Humidity');
-          this.setServiceName(svc, name);
-        }
-      }
-    } else {
-      const main = this.accessory.getServiceById(Service.HumiditySensor, 'Humidity');
-      if (main) this.accessory.removeService(main);
-      this.removeChildAccessory('hum'); this.children.hum = null;
-    }
-
-    // Air Quality
-    if (this.config.showAirQuality !== false) {
-      if (this.config.separateAirQualityAccessory === true) {
-        const name = this.config.airQualityName || `${this.config.name} Air Quality`;
-        const child = this.ensureChildAccessory('aq', name, Service.AirQualitySensor);
-        const svc = child.getService(Service.AirQualitySensor) || child.addService(Service.AirQualitySensor, name);
-        this.setServiceName(svc, name);
-        this.children.aq = { acc: child, svc };
-        const main = this.accessory.getServiceById(Service.AirQualitySensor, 'AirQuality');
-        if (main) this.accessory.removeService(main);
-      } else {
-        this.children.aq = null;
-        let svc = this.accessory.getServiceById(Service.AirQualitySensor, 'AirQuality');
-        if (!svc) {
-          const name = this.config.airQualityName || `${this.config.name} Air Quality`;
-          svc = this.accessory.addService(Service.AirQualitySensor, name, 'AirQuality');
-          this.setServiceName(svc, name);
-        }
-      }
-    } else {
-      const main = this.accessory.getServiceById(Service.AirQualitySensor, 'AirQuality');
-      if (main) this.accessory.removeService(main);
-      this.removeChildAccessory('aq'); this.children.aq = null;
+  ensureSensorsAndSwitches() {
+    // AQI Sensor
+    if (!this.children.aq) {
+      const child = this.ensureChildAccessory('aq', `${this.config.name} AQI`, Service.AirQualitySensor);
+      const svc = child.getService(Service.AirQualitySensor) || child.addService(Service.AirQualitySensor, `${this.config.name} AQI`);
+      this.setServiceName(svc, `${this.config.name} AQI`);
+      this.children.aq = { acc: child, svc };
     }
 
     // LED switch
@@ -319,8 +298,18 @@ class DeviceHandler {
         const main = this.accessory.getServiceById(Service.Switch, 'LED');
         if (main) this.accessory.removeService(main);
         svc.getCharacteristic(Characteristic.On).onSet(async (v) => {
-          if (this.config.type === 'MiAirPurifierPro') await this.setPropertyValue('set_led_b', [v ? 0 : 2]);
-          else await this.setPropertyValue('set_led', [v ? 'on' : 'off']);
+          const prev = this.state.led;
+          const next = v ? 'on' : 'off';
+          this.state.led = next;
+          try {
+            this.updateAllCharacteristics();
+            if (this.config.type === 'MiAirPurifierPro') await this.setPropertyValue('set_led_b', [v ? 0 : 2]);
+            else await this.setPropertyValue('set_led', [next]);
+          } catch (e) {
+            this.state.led = prev;
+            this.updateAllCharacteristics();
+            throw e;
+          }
         });
       } else {
         this.children.led = null;
@@ -330,8 +319,18 @@ class DeviceHandler {
           svc = this.accessory.addService(Service.Switch, name, 'LED');
           this.setServiceName(svc, name);
           svc.getCharacteristic(Characteristic.On).onSet(async (v) => {
-            if (this.config.type === 'MiAirPurifierPro') await this.setPropertyValue('set_led_b', [v ? 0 : 2]);
-            else await this.setPropertyValue('set_led', [v ? 'on' : 'off']);
+            const prev = this.state.led;
+            const next = v ? 'on' : 'off';
+            this.state.led = next;
+            try {
+              this.updateAllCharacteristics();
+              if (this.config.type === 'MiAirPurifierPro') await this.setPropertyValue('set_led_b', [v ? 0 : 2]);
+              else await this.setPropertyValue('set_led', [next]);
+            } catch (e) {
+              this.state.led = prev;
+              this.updateAllCharacteristics();
+              throw e;
+            }
           });
         }
       }
@@ -352,7 +351,17 @@ class DeviceHandler {
         const main = this.accessory.getServiceById(Service.Switch, 'Buzzer');
         if (main) this.accessory.removeService(main);
         svc.getCharacteristic(Characteristic.On).onSet(async (v) => {
-          await this.setPropertyValue('set_buzzer', [v ? 'on' : 'off']);
+          const prev = this.state.buzzer;
+          const next = v ? 'on' : 'off';
+          this.state.buzzer = next;
+          try {
+            this.updateAllCharacteristics();
+            await this.setPropertyValue('set_buzzer', [next]);
+          } catch (e) {
+            this.state.buzzer = prev;
+            this.updateAllCharacteristics();
+            throw e;
+          }
         });
       } else {
         this.children.buzzer = null;
@@ -362,7 +371,17 @@ class DeviceHandler {
           svc = this.accessory.addService(Service.Switch, name, 'Buzzer');
           this.setServiceName(svc, name);
           svc.getCharacteristic(Characteristic.On).onSet(async (v) => {
-            await this.setPropertyValue('set_buzzer', [v ? 'on' : 'off']);
+            const prev = this.state.buzzer;
+            const next = v ? 'on' : 'off';
+            this.state.buzzer = next;
+            try {
+              this.updateAllCharacteristics();
+              await this.setPropertyValue('set_buzzer', [next]);
+            } catch (e) {
+              this.state.buzzer = prev;
+              this.updateAllCharacteristics();
+              throw e;
+            }
           });
         }
       }
@@ -384,9 +403,19 @@ class DeviceHandler {
         const main = this.accessory.getServiceById(Service.Switch, 'AutoMode');
         if (main) this.accessory.removeService(main);
         svc.getCharacteristic(Characteristic.On).onSet(async (v) => {
-          if (v) await this.setPropertyValue('set_mode', ['auto']);
-          else if (this.state.mode === 'auto') await this.setPropertyValue('set_mode', ['favorite']);
-        });
+            const prev = this.state.mode;
+            const next = v ? 'auto' : (this.state.mode === 'auto' ? 'favorite' : this.state.mode);
+            if (next !== prev) this.state.mode = next;
+            try {
+              this.updateAllCharacteristics();
+              if (v) await this.setPropertyValue('set_mode', ['auto']);
+              else if (prev === 'auto') await this.setPropertyValue('set_mode', ['favorite']);
+            } catch (e) {
+              this.state.mode = prev;
+              this.updateAllCharacteristics();
+              throw e;
+            }
+          });
       } else {
         this.children.auto = null;
         let svc = this.accessory.getServiceById(Service.Switch, 'AutoMode');
@@ -395,8 +424,18 @@ class DeviceHandler {
           svc = this.accessory.addService(Service.Switch, name, 'AutoMode');
           this.setServiceName(svc, name);
           svc.getCharacteristic(Characteristic.On).onSet(async (v) => {
-            if (v) await this.setPropertyValue('set_mode', ['auto']);
-            else if (this.state.mode === 'auto') await this.setPropertyValue('set_mode', ['favorite']);
+            const prev = this.state.mode;
+            const next = v ? 'auto' : (this.state.mode === 'auto' ? 'favorite' : this.state.mode);
+            if (next !== prev) this.state.mode = next;
+            try {
+              this.updateAllCharacteristics();
+              if (v) await this.setPropertyValue('set_mode', ['auto']);
+              else if (prev === 'auto') await this.setPropertyValue('set_mode', ['favorite']);
+            } catch (e) {
+              this.state.mode = prev;
+              this.updateAllCharacteristics();
+              throw e;
+            }
           });
         }
       }
@@ -417,9 +456,19 @@ class DeviceHandler {
         const main = this.accessory.getServiceById(Service.Switch, 'SleepMode');
         if (main) this.accessory.removeService(main);
         svc.getCharacteristic(Characteristic.On).onSet(async (v) => {
-          if (v) await this.setPropertyValue('set_mode', ['silent']);
-          else if (this.state.mode === 'silent') await this.setPropertyValue('set_mode', ['favorite']);
-        });
+            const prev = this.state.mode;
+            const next = v ? 'silent' : (this.state.mode === 'silent' ? 'favorite' : this.state.mode);
+            if (next !== prev) this.state.mode = next;
+            try {
+              this.updateAllCharacteristics();
+              if (v) await this.setPropertyValue('set_mode', ['silent']);
+              else if (prev === 'silent') await this.setPropertyValue('set_mode', ['favorite']);
+            } catch (e) {
+              this.state.mode = prev;
+              this.updateAllCharacteristics();
+              throw e;
+            }
+          });
       } else {
         this.children.sleep = null;
         let svc = this.accessory.getServiceById(Service.Switch, 'SleepMode');
@@ -428,8 +477,18 @@ class DeviceHandler {
           svc = this.accessory.addService(Service.Switch, name, 'SleepMode');
           this.setServiceName(svc, name);
           svc.getCharacteristic(Characteristic.On).onSet(async (v) => {
-            if (v) await this.setPropertyValue('set_mode', ['silent']);
-            else if (this.state.mode === 'silent') await this.setPropertyValue('set_mode', ['favorite']);
+            const prev = this.state.mode;
+            const next = v ? 'silent' : (this.state.mode === 'silent' ? 'favorite' : this.state.mode);
+            if (next !== prev) this.state.mode = next;
+            try {
+              this.updateAllCharacteristics();
+              if (v) await this.setPropertyValue('set_mode', ['silent']);
+              else if (prev === 'silent') await this.setPropertyValue('set_mode', ['favorite']);
+            } catch (e) {
+              this.state.mode = prev;
+              this.updateAllCharacteristics();
+              throw e;
+            }
           });
         }
       }
@@ -450,8 +509,18 @@ class DeviceHandler {
         const main = this.accessory.getServiceById(Service.Switch, 'FavoriteMode');
         if (main) this.accessory.removeService(main);
         svc.getCharacteristic(Characteristic.On).onSet(async (v) => {
-          if (v) await this.setPropertyValue('set_mode', ['favorite']);
-          else if (this.state.mode === 'favorite') await this.setPropertyValue('set_mode', ['auto']);
+          const prev = this.state.mode;
+          const next = v ? 'favorite' : (this.state.mode === 'favorite' ? 'auto' : this.state.mode);
+          if (next !== prev) this.state.mode = next;
+          try {
+            this.updateAllCharacteristics();
+            if (v) await this.setPropertyValue('set_mode', ['favorite']);
+            else if (prev === 'favorite') await this.setPropertyValue('set_mode', ['auto']);
+          } catch (e) {
+            this.state.mode = prev;
+            this.updateAllCharacteristics();
+            throw e;
+          }
         });
       } else {
         this.children.fav = null;
@@ -461,8 +530,18 @@ class DeviceHandler {
           svc = this.accessory.addService(Service.Switch, name, 'FavoriteMode');
           this.setServiceName(svc, name);
           svc.getCharacteristic(Characteristic.On).onSet(async (v) => {
-            if (v) await this.setPropertyValue('set_mode', ['favorite']);
-            else if (this.state.mode === 'favorite') await this.setPropertyValue('set_mode', ['auto']);
+            const prev = this.state.mode;
+            const next = v ? 'favorite' : (this.state.mode === 'favorite' ? 'auto' : this.state.mode);
+            if (next !== prev) this.state.mode = next;
+            try {
+              this.updateAllCharacteristics();
+              if (v) await this.setPropertyValue('set_mode', ['favorite']);
+              else if (prev === 'favorite') await this.setPropertyValue('set_mode', ['auto']);
+            } catch (e) {
+              this.state.mode = prev;
+              this.updateAllCharacteristics();
+              throw e;
+            }
           });
         }
       }
@@ -473,104 +552,103 @@ class DeviceHandler {
     }
   }
 
-  setupAccessoryInfo() {
-    const info = this.accessory.getService(Service.AccessoryInformation);
-    info.setCharacteristic(Characteristic.Manufacturer, 'Xiaomi')
-        .setCharacteristic(Characteristic.Model, this.config.type || 'Unknown')
-        .setCharacteristic(Characteristic.SerialNumber, this.config.serialNumber || this.config.ip || 'Unknown');
-
-    // 펌웨어 버전 = 플러그인 버전
-    try { info.setCharacteristic(Characteristic.FirmwareRevision, packageJson.version); } catch (_) {}
-  }
-
-  setupAirPurifierMain() {
-    const service =
-      this.accessory.getService(Service.AirPurifier) ||
-      this.accessory.addService(Service.AirPurifier, this.config.name);
-    this.setServiceName(service, this.config.name);
-
-    service.getCharacteristic(Characteristic.Active)
-      .onSet(async (v) => this.setPropertyValue('set_power', [v ? 'on' : 'off']));
-
-    // 0=MANUAL, 1=AUTO → AUTO=auto, MANUAL=favorite
-    service.getCharacteristic(Characteristic.TargetAirPurifierState)
-      .onSet(async (v) => this.setPropertyValue('set_mode', [
-        v === Characteristic.TargetAirPurifierState.AUTO ? 'auto' : 'favorite'
-      ]));
-
-    // 속도 슬라이더 → favorite 레벨로 (set_level_favorite 고정)
-    service.getCharacteristic(Characteristic.RotationSpeed)
-      .onSet(async (v) => this.setFavoriteLevelPercent(Number(v)));
-  }
-
-  // ===== Runtime updates =====
-  updateAllCharacteristics() {
-    // Air Purifier main
-    const svcAp = this.accessory.getService(Service.AirPurifier);
-    if (svcAp) {
-      const powerOn = this.state.power === 'on';
-      svcAp.updateCharacteristic(Characteristic.Active, powerOn ? 1 : 0);
-
-      // 표시: auto만 자동, favorite/silent은 수동
-      const isAuto = this.state.mode === 'auto';
-      svcAp.updateCharacteristic(
-        Characteristic.TargetAirPurifierState,
-        isAuto ? Characteristic.TargetAirPurifierState.AUTO : Characteristic.TargetAirPurifierState.MANUAL
-      );
-
-      svcAp.updateCharacteristic(
-        Characteristic.CurrentAirPurifierState,
-        powerOn ? Characteristic.CurrentAirPurifierState.PURIFYING_AIR : Characteristic.CurrentAirPurifierState.INACTIVE
-      );
-
-      const fav = Number(this.state.favorite_level);
-      const speed = Number.isFinite(fav) ? Math.max(0, Math.min(100, Math.round((fav / this.maxFavoriteLevel) * 100))) : 0;
-      svcAp.updateCharacteristic(Characteristic.RotationSpeed, speed);
-
-      const life = Number(this.state.filter1_life);
-      if (Number.isFinite(life)) {
-        svcAp.updateCharacteristic(Characteristic.FilterLifeLevel, life);
-        svcAp.updateCharacteristic(Characteristic.FilterChangeIndication, life < 5 ? 1 : 0);
-      }
+  ensureChildAccessory(suffix, name, svcType) {
+    const id = `${this.accessory.UUID}:${suffix}`;
+    let acc = this.platform.accessories.get(id);
+    if (!acc) {
+      acc = new PlatformAccessory(name, id);
+      acc.category = this.api.hap.Categories.OTHER;
+      acc.context.parentUUID = this.accessory.UUID;
+      this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [acc]);
+      this.platform.accessories.set(id, acc);
     }
+    return acc;
+  }
 
-    // Temperature
-    const tempVal = Number(this.state.temp_dec);
-    const tempC = Number.isFinite(tempVal) ? tempVal / 10 : 0;
-    const tChild = this.children.temp?.svc;
-    const tMain = this.accessory.getServiceById(Service.TemperatureSensor, 'Temperature');
-    (tChild || tMain)?.updateCharacteristic(Characteristic.CurrentTemperature, tempC);
+  removeChildAccessory(suffix) {
+    const id = `${this.accessory.UUID}:${suffix}`;
+    const acc = this.platform.accessories.get(id);
+    if (acc) {
+      try {
+        this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [acc]);
+      } catch (_) {}
+      this.platform.accessories.delete(id);
+    }
+  }
 
-    // Humidity
-    const humVal = Number(this.state.humidity);
-    const hChild = this.children.hum?.svc;
-    const hMain = this.accessory.getServiceById(Service.HumiditySensor, 'Humidity');
-    (hChild || hMain)?.updateCharacteristic(Characteristic.CurrentRelativeHumidity, Number.isFinite(humVal) ? humVal : 0);
+  async setFavoriteLevelPercent(percent) {
+    const p = Math.max(0, Math.min(100, Number(percent) || 0));
+    const level = Math.max(this.minFavoriteLevel, Math.min(this.maxFavoriteLevel, Math.round((p / 100) * this.maxFavoriteLevel)));
+    await this.setPropertyValue('set_level_favorite', [level]);
+    this.state.favorite_level = level;
+  }
 
-    // Air Quality
+  async setPropertyValue(method, args) {
+    await this.connect();
+    try {
+      const res = await this.device.call(method, args);
+      this.log.debug?.(this.prefix(`${method}(${JSON.stringify(args)}) → ${JSON.stringify(res)}`));
+      return res;
+    } catch (e) {
+      this.log.error(this.prefix(`${method} 실패: ${e.message || e}`));
+      throw e;
+    }
+  }
+
+  mapAqiToHomeKitLevel(aqi, t) {
+    if (!Number.isFinite(aqi)) return Characteristic.AirQuality.UNKNOWN; // 0
+    if (aqi <= t[0]) return Characteristic.AirQuality.EXCELLENT; // 1
+    if (aqi <= t[1]) return Characteristic.AirQuality.GOOD;      // 2
+    if (aqi <= t[2]) return Characteristic.AirQuality.FAIR;      // 3
+    if (aqi <= t[3]) return Characteristic.AirQuality.INFERIOR;  // 4
+    return Characteristic.AirQuality.POOR;                        // 5
+  }
+
+  updateAllCharacteristics() {
+    const svcAp = this.accessory.getService(Service.AirPurifier);
+    if (!svcAp) return;
+
+    const powerOn = (this.state.power === 'on');
+    svcAp.updateCharacteristic(Characteristic.Active, powerOn ? 1 : 0);
+
+    // map mode to TargetAirPurifierState (1=AUTO, 0=MANUAL)
+    const targetMode =
+      this.state.mode === 'auto'
+        ? Characteristic.TargetAirPurifierState.AUTO
+        : Characteristic.TargetAirPurifierState.MANUAL;
+    svcAp.updateCharacteristic(Characteristic.TargetAirPurifierState, targetMode);
+
+    const currentState =
+      powerOn
+        ? Characteristic.CurrentAirPurifierState.PURIFYING_AIR
+        : Characteristic.CurrentAirPurifierState.INACTIVE;
+    svcAp.updateCharacteristic(Characteristic.CurrentAirPurifierState, currentState);
+
+    // AQI → AirQuality + PM2_5Density
     const aqi = Number(this.state.aqi);
-    const aqLevel = this.mapAqiToHomeKitLevel(aqi, this.aqThresholds);
-    const aqChild = this.children.aq?.svc;
-    const aqMain = this.accessory.getServiceById(Service.AirQualitySensor, 'AirQuality');
-    if (aqChild || aqMain) {
-      (aqChild || aqMain).updateCharacteristic(Characteristic.AirQuality, aqLevel);
-      if (Number.isFinite(aqi)) (aqChild || aqMain).updateCharacteristic(Characteristic.PM2_5Density, aqi);
+    if (Number.isFinite(aqi)) {
+      const hkLevel = this.mapAqiToHomeKitLevel(aqi, this.aqiThresholds);
+      const aqSvc = this.children.aq?.svc || this.accessory.getService(Service.AirQualitySensor);
+      aqSvc?.updateCharacteristic(Characteristic.AirQuality, hkLevel);
+      aqSvc?.updateCharacteristic(Characteristic.PM2_5Density, aqi);
     }
 
     // LED
+    const ledOn = (this.state.led === 'on' || this.state.led === 0);
     const ledChild = this.children.led?.svc;
     const ledMain = this.accessory.getServiceById(Service.Switch, 'LED');
-    (ledChild || ledMain)?.updateCharacteristic(Characteristic.On, this.state.led === 'on');
+    (ledChild || ledMain)?.updateCharacteristic(Characteristic.On, !!ledOn);
 
     // Buzzer
+    const buzzerOn = (this.state.buzzer === 'on');
     const buzChild = this.children.buzzer?.svc;
     const buzMain = this.accessory.getServiceById(Service.Switch, 'Buzzer');
-    (buzChild || buzMain)?.updateCharacteristic(Characteristic.On, this.state.buzzer === 'on');
+    (buzChild || buzMain)?.updateCharacteristic(Characteristic.On, !!buzzerOn);
 
     // Modes
-    const autoOn = this.state.mode === 'auto';
-    const sleepOn = this.state.mode === 'silent';
-    const favOn = this.state.mode === 'favorite';
+    const autoOn = (this.state.mode === 'auto');
+    const sleepOn = (this.state.mode === 'silent');
+    const favOn = (this.state.mode === 'favorite');
 
     const autoChild = this.children.auto?.svc;
     const autoMain = this.accessory.getServiceById(Service.Switch, 'AutoMode');
@@ -583,5 +661,16 @@ class DeviceHandler {
     const favChild = this.children.fav?.svc;
     const favMain = this.accessory.getServiceById(Service.Switch, 'FavoriteMode');
     (favChild || favMain)?.updateCharacteristic(Characteristic.On, favOn);
+
+    // Favorite level → RotationSpeed
+    const fav = Number(this.state.favorite_level);
+    const speed = Number.isFinite(fav) ? Math.max(0, Math.min(100, Math.round((fav / this.maxFavoriteLevel) * 100))) : 0;
+    svcAp.updateCharacteristic(Characteristic.RotationSpeed, speed);
+
+    // Filter life
+    const life = Number(this.state.filter1_life);
+    if (Number.isFinite(life)) {
+      svcAp.updateCharacteristic(Characteristic.FilterLifeLevel, life);
+    }
   }
 }
