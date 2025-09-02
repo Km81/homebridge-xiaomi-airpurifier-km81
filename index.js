@@ -36,20 +36,19 @@ class XiaomiAirPurifierPlatform {
       c.token = (c.token || '').toString();
       c.type = (c.type || 'MiAirPurifier2S').toString(); // MiAirPurifier2S | MiAirPurifierPro
 
-      // 센서/스위치 표시 기본값: schema의 default 따름
-      c.showTemperature = c.showTemperature !== false; // default true
+      // 센서/스위치 표시 기본값
+      c.showTemperature = c.showTemperature !== false;
       c.separateTemperatureAccessory = !!c.separateTemperatureAccessory;
       c.temperatureName = c.temperatureName || '';
 
-      c.showHumidity = c.showHumidity !== false; // default true
+      c.showHumidity = c.showHumidity !== false;
       c.separateHumidityAccessory = !!c.separateHumidityAccessory;
       c.humidityName = c.humidityName || '';
 
-      c.showAirQuality = c.showAirQuality !== false; // default true
+      c.showAirQuality = c.showAirQuality !== false;
       c.separateAirQualityAccessory = !!c.separateAirQualityAccessory;
       c.airQualityName = c.airQualityName || '';
 
-      // t1..t4 (매우좋음/좋음/보통/나쁨 상한)
       const aq = c.airQualityThresholds || {};
       c.airQualityThresholds = {
         t1: isFiniteNumber(aq.t1) ? Number(aq.t1) : 5,
@@ -58,7 +57,6 @@ class XiaomiAirPurifierPlatform {
         t4: isFiniteNumber(aq.t4) ? Number(aq.t4) : 55
       };
 
-      // LED/Buzzer/모드 스위치(기본 false)
       c.showLED = !!c.showLED;
       c.separateLedAccessory = !!c.separateLedAccessory;
       c.ledName = c.ledName || '';
@@ -152,6 +150,7 @@ class XiaomiAirPurifierDevice {
     };
 
     this.state = {}; // power, mode, aqi, temperature, humidity, favorite_level, led, buzzer, ...
+    this.filterSvc = null; // FilterMaintenance service
 
     this.ensureInformationService();
   }
@@ -167,7 +166,7 @@ class XiaomiAirPurifierDevice {
 
   prefix(msg) { return `[${this.config.name}] ${msg}`; }
 
-  // 경고 제거 버전
+  // 경고 최소화를 위한 안전 버전
   setSvcName(svc, name) {
     const { Characteristic } = this.hap;
     try {
@@ -194,6 +193,10 @@ class XiaomiAirPurifierDevice {
     // Main AirPurifier service
     const ap = this.accessory.getService(Service.AirPurifier) || this.accessory.addService(Service.AirPurifier, this.config.name);
     this.setSvcName(ap, this.config.name);
+
+    // FilterMaintenance service (Filter Life Level 경고 방지)
+    this.filterSvc = this.accessory.getService(Service.FilterMaintenance) ||
+                     this.accessory.addService(Service.FilterMaintenance, `${this.config.name} Filter`);
 
     // === 낙관적 업데이트 ===
     ap.getCharacteristic(Characteristic.Active).onSet(async (v) => {
@@ -482,7 +485,6 @@ class XiaomiAirPurifierDevice {
       return holder;
     };
 
-    // Auto
     if (this.config.showAutoModeSwitch) {
       this.child.auto = bindModeSwitch('Auto', this.config.autoModeName || `${this.config.name} Auto Mode`, 'auto', 'favorite');
     } else {
@@ -492,7 +494,6 @@ class XiaomiAirPurifierDevice {
       this.child.auto = null;
     }
 
-    // Sleep
     if (this.config.showSleepModeSwitch) {
       this.child.sleep = bindModeSwitch('Sleep', this.config.sleepModeName || `${this.config.name} Sleep Mode`, 'silent', 'favorite');
     } else {
@@ -502,7 +503,6 @@ class XiaomiAirPurifierDevice {
       this.child.sleep = null;
     }
 
-    // Favorite
     if (this.config.showFavoriteModeSwitch) {
       this.child.fav = bindModeSwitch('Favorite', this.config.favoriteModeName || `${this.config.name} Favorite Mode`, 'favorite', 'auto');
     } else {
@@ -600,52 +600,45 @@ class XiaomiAirPurifierDevice {
       ap.updateCharacteristic(Characteristic.RotationSpeed, speed);
     }
 
-    // 필터 수명
-    if (isFiniteNumber(this.state.filter1_life)) {
-      ap.updateCharacteristic(Characteristic.FilterLifeLevel, Number(this.state.filter1_life));
-    }
-
-    // Temperature
+    // === 센서류: 전원과 무관하게 업데이트 ===
     if (this.child.temp?.svc && isFiniteNumber(this.state.temperature)) {
       this.child.temp.svc.updateCharacteristic(Characteristic.CurrentTemperature, Number(this.state.temperature));
     }
-
-    // Humidity
     if (this.child.humi?.svc && isFiniteNumber(this.state.humidity)) {
       this.child.humi.svc.updateCharacteristic(Characteristic.CurrentRelativeHumidity, Number(this.state.humidity));
     }
-
-    // AQI
     if (this.child.aq?.svc && isFiniteNumber(this.state.aqi)) {
       const hk = this.mapAqiToHK(Number(this.state.aqi));
       this.child.aq.svc.updateCharacteristic(Characteristic.AirQuality, hk);
-      // 있으면 함께 업데이트 (일부 홈앱에 도움)
       this.child.aq.svc.updateCharacteristic(Characteristic.PM2_5Density, Number(this.state.aqi));
     }
 
-    // LED
+    // === 스위치류: 전원이 꺼져 있으면 OFF로 표기 (UI 일관성) ===
     const ledOn = (this.state.led === 'on' || Number(this.state.led_b) === 0);
     const ledSvc = this.child.led?.svc || this.accessory.getServiceById(Service.Switch, 'LED');
-    ledSvc?.updateCharacteristic(Characteristic.On, !!ledOn);
+    ledSvc?.updateCharacteristic(Characteristic.On, powerOn && !!ledOn);
 
-    // Buzzer
     const bzOn = (this.state.buzzer === 'on');
     const bzSvc = this.child.buzzer?.svc || this.accessory.getServiceById(Service.Switch, 'Buzzer');
-    bzSvc?.updateCharacteristic(Characteristic.On, !!bzOn);
+    bzSvc?.updateCharacteristic(Characteristic.On, powerOn && !!bzOn);
 
-    // Mode switches
     const autoOn = (this.state.mode === 'auto');
     const sleepOn = (this.state.mode === 'silent');
     const favOn = (this.state.mode === 'favorite');
 
     const autoSvc = this.child.auto?.svc || this.accessory.getServiceById(Service.Switch, 'mode-Auto');
-    autoSvc?.updateCharacteristic(Characteristic.On, autoOn);
+    autoSvc?.updateCharacteristic(Characteristic.On, powerOn && autoOn);
 
     const sleepSvc = this.child.sleep?.svc || this.accessory.getServiceById(Service.Switch, 'mode-Sleep');
-    sleepSvc?.updateCharacteristic(Characteristic.On, sleepOn);
+    sleepSvc?.updateCharacteristic(Characteristic.On, powerOn && sleepOn);
 
     const favSvc = this.child.fav?.svc || this.accessory.getServiceById(Service.Switch, 'mode-Favorite');
-    favSvc?.updateCharacteristic(Characteristic.On, favOn);
+    favSvc?.updateCharacteristic(Characteristic.On, powerOn && favOn);
+
+    // === Filter Life Level → FilterMaintenance 서비스로 이동 (경고 제거) ===
+    if (this.filterSvc && isFiniteNumber(this.state.filter1_life)) {
+      this.filterSvc.updateCharacteristic(Characteristic.FilterLifeLevel, Number(this.state.filter1_life));
+    }
   }
 }
 
