@@ -1,5 +1,5 @@
 {
-  "name": "@km81/homebridge-xiaomi-airpurifier",
+  "name": "homebridge-xiaomi-airpurifier-km81",
   "version": "1.0.0",
   "description": "A modern, single-file Homebridge plugin for Xiaomi Air Purifier 2S and Pro.",
   "main": "index.js",
