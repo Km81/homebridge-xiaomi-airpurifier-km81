@@ -166,9 +166,24 @@ class XiaomiAirPurifierDevice {
   }
 
   prefix(msg) { return `[${this.config.name}] ${msg}`; }
+
+  // 경고 제거 버전
   setSvcName(svc, name) {
-    try { svc.setCharacteristic(this.hap.Characteristic.ConfiguredName, name); } catch (_) {}
-    try { svc.setCharacteristic(this.hap.Characteristic.Name, name); } catch (_) {}
+    const { Characteristic } = this.hap;
+    try {
+      if (typeof svc.testCharacteristic === 'function' &&
+          svc.testCharacteristic(Characteristic.ConfiguredName)) {
+        svc.updateCharacteristic(Characteristic.ConfiguredName, name);
+      }
+    } catch (_) {}
+    try {
+      if (typeof svc.testCharacteristic === 'function' &&
+          svc.testCharacteristic(Characteristic.Name)) {
+        svc.updateCharacteristic(Characteristic.Name, name);
+      } else {
+        svc.setCharacteristic?.(Characteristic.Name, name);
+      }
+    } catch (_) {}
   }
 
   async init() {
@@ -282,7 +297,7 @@ class XiaomiAirPurifierDevice {
     if (!isFiniteNumber(this.state.temperature) && isFiniteNumber(this.state.temp_dec)) {
       this.state.temperature = Number(this.state.temp_dec) / 10;
     }
-    // led 보정: led_b(0=켜짐,2=꺼짐)를 led on/off로 매핑
+    // led 보정: led_b(0=켜짐,2=꺼짐)를 led on/off로 매핑 (Pro)
     if (this.state.led_b !== undefined && this.config.type === 'MiAirPurifierPro') {
       this.state.led = (Number(this.state.led_b) === 0) ? 'on' : 'off';
     }
@@ -297,7 +312,6 @@ class XiaomiAirPurifierDevice {
       if (this.config.separateTemperatureAccessory) {
         this.child.temp = this.ensureChild('temp', this.config.temperatureName || `${this.config.name} Temperature`, Service.TemperatureSensor);
       } else {
-        // 메인 악세서리에 서비스 추가
         const svc = this.accessory.getServiceById(Service.TemperatureSensor, 'TEMP') ||
                     this.accessory.addService(Service.TemperatureSensor, this.config.temperatureName || `${this.config.name} Temperature`, 'TEMP');
         this.setSvcName(svc, this.config.temperatureName || `${this.config.name} Temperature`);
@@ -638,3 +652,7 @@ class XiaomiAirPurifierDevice {
 // ===== helpers =====
 function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
 function isFiniteNumber(v) { return typeof v === 'number' && Number.isFinite(v); }
+function capitalize(s) {
+  const t = String(s || '');
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
